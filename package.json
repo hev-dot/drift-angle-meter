@@ -1,0 +1,12 @@
+{
+  "name": "drift-angle-meter",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser-based car drift (sideslip) angle meter using phone sensors",
+  "type": "module",
+  "scripts": {
+    "sim": "node js/sim/run-cli.js",
+    "sim:one": "node js/sim/run-cli.js --runs 1 --verbose",
+    "serve": "node tools/serve.js 8080"
+  }
+}
