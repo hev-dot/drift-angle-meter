@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d0d0d">
+<link rel="icon" href="data:,">
+<title>Drift Angle Meter</title>
+<meta name="description" content="Measure your car's drift angle with your phone's own sensors. No installation.">
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7;
+    --surface-1: #fcfcfb;
+    --surface-2: #f0efec;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --border: rgba(11, 11, 11, 0.10);
+    --accent: #2a78d6;
+    --peak: #eb6834;
+    --good: #0ca30c;
+    --warning: #fab219;
+    --critical: #d03b3b;
+    --good-text: #006300;
+    --on-accent: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #0d0d0d;
+      --surface-1: #1a1a19;
+      --surface-2: #232322;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted: #898781;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --border: rgba(255, 255, 255, 0.10);
+      --accent: #3987e5;
+      --peak: #d95926;
+      --good-text: #0ca30c;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface-1: #1a1a19;
+    --surface-2: #232322;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --accent: #3987e5;
+    --peak: #d95926;
+    --good-text: #0ca30c;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { margin: 0; }
+  body {
+    background: var(--page); color: var(--text-primary);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .app {
+    max-width: 720px; margin: 0 auto;
+    padding: max(12px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
+             max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  }
+  header.top { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  header.top .title { font-weight: 650; font-size: 17px; margin-right: auto; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 999px;
+    background: var(--surface-2); color: var(--text-secondary); font-size: 12px; white-space: nowrap;
+  }
+  .chip .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
+  .chip.good .dot { background: var(--good); }
+  .chip.warning .dot { background: var(--warning); }
+  .chip.critical .dot { background: var(--critical); }
+  button {
+    font: inherit; color: var(--text-primary); background: var(--surface-1);
+    border: 1px solid var(--axis); border-radius: 10px; padding: 10px 14px; cursor: pointer;
+    min-height: 44px;
+  }
+  button:disabled { opacity: 0.5; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+  button.icon { min-width: 44px; padding: 8px; font-size: 18px; line-height: 1; }
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 14px;
+    padding: 16px; margin-bottom: 12px;
+  }
+  .intro h1 { font-size: 22px; margin: 0 0 6px; }
+  .intro p { margin: 0 0 12px; color: var(--text-secondary); }
+  .intro ol { margin: 0 0 16px; padding-left: 22px; }
+  .intro li { margin-bottom: 6px; }
+  .intro .start { width: 100%; font-size: 17px; min-height: 52px; }
+  .fine { font-size: 12px; color: var(--text-muted); margin-top: 12px !important; }
+  .error {
+    color: var(--critical); font-weight: 500; margin: 12px 0 0; display: flex; gap: 6px;
+  }
+  .error:empty { display: none; }
+  .error::before { content: "⚠"; }
+
+  .gauge-card { padding: 8px 8px 4px; }
+  #gauge { display: block; width: 100%; max-height: 52vh; }
+  #gauge .track { fill: none; stroke: var(--grid); stroke-width: 14; stroke-linecap: round; }
+  #gauge .value { fill: none; stroke: var(--accent); stroke-width: 14; stroke-linecap: round; }
+  #gauge .tick { stroke: var(--axis); stroke-width: 2; }
+  #gauge .tick.major { stroke: var(--text-muted); }
+  #gauge .tlabel { fill: var(--text-muted); font-size: 12px; text-anchor: middle; dominant-baseline: middle; }
+  #gauge .marker { fill: var(--text-primary); stroke: var(--surface-1); stroke-width: 3; }
+  #gauge .peak { fill: var(--peak); }
+  #gauge .angle { fill: var(--text-primary); font-size: 60px; font-weight: 650; text-anchor: middle; }
+  #gauge .dir { fill: var(--text-secondary); font-size: 15px; text-anchor: middle; }
+  #gauge.dim .value, #gauge.dim .marker, #gauge.dim .angle { opacity: 0.35; }
+
+  .status .msg { font-weight: 600; }
+  .status .sub { color: var(--text-secondary); font-size: 13px; margin-top: 4px; }
+  .status .notice { color: var(--critical); font-size: 13px; margin-bottom: 6px; }
+  .status .notice:empty { display: none; }
+  .bar { height: 6px; border-radius: 3px; background: var(--grid); margin-top: 10px; overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 3px; transition: width .3s; }
+
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 12px; }
+  .stat { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 10px; min-width: 0; }
+  .stat .k { color: var(--text-muted); font-size: 12px; }
+  .stat .v { font-size: 22px; font-weight: 650; }
+  .stat .v small { font-size: 12px; font-weight: 400; color: var(--text-secondary); }
+  .stat .s { color: var(--text-secondary); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .actions button { flex: 1 1 0; min-width: 100px; }
+  .warn { color: var(--text-secondary); font-size: 13px; margin: 0 0 12px; }
+  .warn:empty { display: none; }
+  .warn::before { content: "⚠ "; color: var(--critical); }
+
+  dialog {
+    border: 1px solid var(--border); border-radius: 14px; background: var(--surface-1);
+    color: var(--text-primary); padding: 18px; width: min(420px, calc(100vw - 32px));
+  }
+  dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
+  dialog h2 { margin: 0 0 12px; font-size: 18px; }
+  dialog label { display: block; margin-bottom: 12px; color: var(--text-secondary); font-size: 14px; }
+  dialog input {
+    display: block; width: 100%; margin-top: 4px; padding: 9px 10px; font: inherit; font-size: 16px;
+    border: 1px solid var(--axis); border-radius: 8px; background: var(--page); color: var(--text-primary);
+  }
+  dialog .hint { font-size: 12px; color: var(--text-muted); margin-top: 3px; }
+  dialog .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; }
+
+  @media (max-width: 480px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+  }
+  /* phone in landscape: gauge left, everything else right */
+  @media (orientation: landscape) and (max-height: 560px) {
+    #live:not([hidden]) { display: grid; grid-template-columns: 1.25fr 1fr; gap: 12px; align-items: start; }
+    #live .gauge-card { grid-row: span 4; margin: 0; }
+    #gauge { max-height: 78vh; }
+    .stats { grid-template-columns: repeat(2, 1fr); margin: 0; }
+    #live .status { margin: 0; }
+  }
+</style>
+</head>
+<body>
+<main class="app">
+  <header class="top">
+    <div class="title">Drift angle</div>
+    <span class="chip" id="gpsChip" hidden><i class="dot"></i><span>GPS</span></span>
+    <span class="chip" id="qualityChip" hidden><i class="dot"></i><span></span></span>
+    <button class="icon" id="settingsBtn" aria-label="Settings" title="Settings">⚙</button>
+  </header>
+
+  <section class="card intro" id="intro">
+    <h1>Measure your drift angle</h1>
+    <p>Uses your phone's motion sensors and GPS. Nothing to install, and it calibrates itself for your phone.</p>
+    <ol>
+      <li><b>Mount the phone firmly</b>, in any orientation. It must not move while you drive.</li>
+      <li>Tap <b>Start</b> and allow motion and location access.</li>
+      <li><b>Keep the car still</b> for about 3 seconds.</li>
+      <li><b>Drive normally for about a minute</b>: a few turns, some accelerating and braking.</li>
+      <li>Once the gauge is live, go drift.</li>
+    </ol>
+    <button class="primary start" id="startBtn">Start</button>
+    <p class="error" id="introError" role="alert"></p>
+    <p class="fine">Keep the screen on and the browser in front while measuring. Only drift on closed
+      courses or other places where it's legal and safe. Don't look at the phone while driving.</p>
+  </section>
+
+  <section id="live" hidden>
+    <div class="card gauge-card">
+      <svg id="gauge" viewBox="0 0 320 200" role="img" aria-label="Drift angle gauge">
+        <path class="track" id="gTrack"/>
+        <g id="gTicks"></g>
+        <path class="value" id="gValue"/>
+        <path class="peak" id="gPeak" d="M0 0" visibility="hidden"/>
+        <circle class="marker" id="gMarker" r="10" cx="160" cy="44"/>
+        <text class="angle" id="gAngle" x="160" y="150">–</text>
+        <text class="dir" id="gDir" x="160" y="180"></text>
+      </svg>
+    </div>
+    <div class="card status" id="statusPanel">
+      <div class="notice" id="statusNotice"></div>
+      <div class="msg" id="statusMsg">Starting…</div>
+      <div class="sub" id="statusSub"></div>
+      <div class="bar" id="statusBar"><i id="statusProgress"></i></div>
+    </div>
+    <p class="warn" id="liveWarn" role="alert"></p>
+    <div class="stats">
+      <div class="stat"><div class="k">Speed</div><div class="v" id="sSpeed">–</div></div>
+      <div class="stat"><div class="k">This drift</div><div class="v" id="sNow">–</div></div>
+      <div class="stat"><div class="k">Best</div><div class="v" id="sBest">–</div><div class="s" id="sBestSub"></div></div>
+      <div class="stat"><div class="k">Last drift</div><div class="v" id="sLast">–</div><div class="s" id="sLastSub"></div></div>
+    </div>
+    <div class="actions">
+      <button id="stopBtn">Stop</button>
+      <button id="recalBtn">Recalibrate</button>
+      <button id="logBtn">Save log</button>
+    </div>
+  </section>
+
+  <dialog id="settings">
+    <form method="dialog" id="settingsForm">
+      <h2>Settings</h2>
+      <label>Phone distance ahead of the rear axle (m)
+        <input type="number" id="setPhoneX" step="0.1" min="-1" max="5" inputmode="decimal">
+        <div class="hint">A phone on the dashboard is typically about 1.5–1.8 m ahead of the rear axle.</div>
+      </label>
+      <label>Wheelbase (m)
+        <input type="number" id="setWheelbase" step="0.05" min="1.5" max="4.5" inputmode="decimal">
+        <div class="hint">The angle is reported at the middle of the wheelbase. Most cars: 2.4–2.9 m.</div>
+      </label>
+      <div class="row">
+        <button value="cancel" formnovalidate>Cancel</button>
+        <button value="save" class="primary" id="settingsSave">Save</button>
+      </div>
+    </form>
+  </dialog>
+</main>
+<script type="module" src="js/app/app.js"></script>
+</body>
+</html>
