@@ -1,0 +1,2 @@
+# local development certificate (private key) - never publish
+tools/dev-cert.pfx
