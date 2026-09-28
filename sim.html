@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drift Estimator Simulator</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7;
+    --surface-1: #fcfcfb;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --border: rgba(11, 11, 11, 0.10);
+    --series-1: #2a78d6;
+    --series-2: #eb6834;
+    --shade: rgba(137, 135, 129, 0.13);
+    --critical: #d03b3b;
+    --good: #006300;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #0d0d0d;
+      --surface-1: #1a1a19;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted: #898781;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --border: rgba(255, 255, 255, 0.10);
+      --series-1: #3987e5;
+      --series-2: #d95926;
+      --shade: rgba(137, 135, 129, 0.16);
+      --critical: #d03b3b;
+      --good: #0ca30c;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface-1: #1a1a19;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --shade: rgba(137, 135, 129, 0.16);
+    --critical: #d03b3b;
+    --good: #0ca30c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--text-primary);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 48px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--text-secondary); margin: 0 0 16px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin-bottom: 16px; }
+  .controls label { color: var(--text-secondary); display: flex; gap: 6px; align-items: center; }
+  input[type=number] {
+    width: 80px; padding: 5px 8px; border: 1px solid var(--axis); border-radius: 6px;
+    background: var(--surface-1); color: var(--text-primary); font: inherit;
+  }
+  button {
+    padding: 6px 12px; border: 1px solid var(--axis); border-radius: 6px; cursor: pointer;
+    background: var(--surface-1); color: var(--text-primary); font: inherit;
+  }
+  button:hover { border-color: var(--text-muted); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 16px;
+  }
+  .phone { color: var(--text-secondary); font-size: 13px; margin-bottom: 10px; word-break: break-word; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+  .tile .k { color: var(--text-muted); font-size: 12px; }
+  .tile .v { font-size: 20px; font-weight: 600; }
+  .tile .v small { font-size: 12px; font-weight: 400; color: var(--text-secondary); }
+  .chart-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 16px; margin-bottom: 6px; }
+  .chart-head h2 { font-size: 15px; margin: 0; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--text-secondary); font-size: 12px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+  .sw.band { height: 10px; opacity: 0.35; }
+  .sw.shade { height: 10px; background: var(--shade); border: 1px solid var(--axis); }
+  .plot { position: relative; }
+  canvas { display: block; width: 100%; touch-action: none; }
+  .tip {
+    position: absolute; pointer-events: none; background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 9px; font-size: 12px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.15); white-space: nowrap; display: none;
+    font-variant-numeric: tabular-nums;
+  }
+  .tip .muted { color: var(--text-muted); }
+  .hint { color: var(--text-muted); font-size: 12px; margin-top: 4px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+  th { color: var(--text-muted); font-weight: 500; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: var(--shade); }
+  .bad { color: var(--critical); }
+  .scroll { overflow-x: auto; }
+  #mcSummary { margin: 8px 0 10px; color: var(--text-secondary); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Drift estimator simulator</h1>
+  <p class="sub">A randomized virtual phone drives a scripted session: standstill, normal driving
+    (self-calibration), then drifts. The estimator sees only what a browser would deliver.</p>
+
+  <div class="controls">
+    <label>Seed <input id="seed" type="number" value="1" min="1"></label>
+    <button id="run">Run</button>
+    <button id="random">Random phone</button>
+    <label>Monte Carlo runs <input id="mcRuns" type="number" value="20" min="1" max="500"></label>
+    <button id="mc">Run Monte Carlo</button>
+  </div>
+
+  <section class="card">
+    <div class="phone" id="phone">–</div>
+    <div class="tiles" id="tiles"></div>
+  </section>
+
+  <section class="card">
+    <div class="chart-head">
+      <h2>Drift angle (°)</h2>
+      <div class="legend">
+        <span><i class="sw" style="background:var(--series-1)"></i>True</span>
+        <span><i class="sw" style="background:var(--series-2)"></i>Estimated</span>
+        <span><i class="sw band" style="background:var(--series-2)"></i>±2σ confidence</span>
+        <span><i class="sw shade"></i>Estimator in slide mode</span>
+      </div>
+    </div>
+    <div class="plot"><canvas id="cBeta" height="320"></canvas><div class="tip" id="tipBeta"></div></div>
+    <div class="chart-head" style="margin-top:14px">
+      <h2>Error (°)</h2>
+      <div class="legend">
+        <span><i class="sw" style="background:var(--series-2)"></i>Estimated − true</span>
+        <span><i class="sw band" style="background:var(--series-2)"></i>±2σ</span>
+      </div>
+    </div>
+    <div class="plot"><canvas id="cErr" height="170"></canvas><div class="tip" id="tipErr"></div></div>
+    <div class="hint">Drag across a chart to zoom in on a time range; double-click to reset.</div>
+  </section>
+
+  <section class="card" id="mcCard" hidden>
+    <div class="chart-head"><h2>Monte Carlo</h2></div>
+    <div id="mcSummary"></div>
+    <div class="scroll"><table id="mcTable"><thead><tr>
+      <th>Seed</th><th>Phone</th><th>Drift RMSE</th><th>Drift P95</th><th>Grip RMSE</th>
+      <th>Availability</th><th>Overconfident</th><th>Calibrated at</th><th>Faults</th>
+    </tr></thead><tbody></tbody></table></div>
+    <div class="hint">Click a row to open that run.</div>
+  </section>
+</main>
+<script type="module" src="js/sim/sim-page.js"></script>
+</body>
+</html>
