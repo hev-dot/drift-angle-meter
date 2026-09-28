@@ -93,4 +93,24 @@ export function driftSession() {
   return s;
 }
 
-export const SCENARIOS = { driftSession };
+// A short grassroots-track run: a few seconds on the start line, a hard launch, one grip
+// corner and straight into drifts. No warm-up driving at all.
+export function trackRun() {
+  const s = new Scenario();
+  s.hold(6);
+  s.to(3.5, { v: 14 }).hold(0.5);
+  s.to(0.8, { chiDot: 0.35 }).hold(1.5).to(0.8, { chiDot: 0 });
+  s.to(1, { v: 11 });
+  s.to(0.8, { chiDot: 0.5, beta: -30 * DEG }).hold(3);
+  s.to(1, { chiDot: -0.5, beta: 32 * DEG }).hold(3);
+  s.to(1, { chiDot: 0, beta: 0 }).hold(2);
+  s.to(1.5, { v: 13 });
+  s.to(0.8, { chiDot: -0.55, beta: 40 * DEG }).hold(4);
+  s.to(1, { chiDot: 0, beta: 0 }).hold(1.5);
+  s.to(0.8, { chiDot: 0.5, beta: -35 * DEG }).hold(3);
+  s.to(1.2, { chiDot: 0, beta: 0 }).hold(1);
+  s.to(4, { v: 0 }).hold(3);
+  return s;
+}
+
+export const SCENARIOS = { driftSession, trackRun };
