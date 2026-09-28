@@ -11,28 +11,47 @@ const DEMO_SPEED = Math.max(1, Number(params.get('demo')) || 1);
 // ------------------------------------------------------------------ settings
 
 const SETTINGS_KEY = 'drift-meter.settings';
-const DEFAULTS = { phoneX: 1.6, wheelbase: 2.6 };
+const PROFILE_KEY = 'drift-meter.profile';
+const DEFAULTS = { phoneX: 1.6 };
 
-function loadSettings() {
+function loadJson(key, fallback) {
   try {
-    const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
-    return { ...DEFAULTS, ...s };
+    return JSON.parse(localStorage.getItem(key) || 'null') ?? fallback;
   } catch {
-    return { ...DEFAULTS };
+    return fallback;
   }
 }
 
-function saveSettings(s) {
-  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch { /* storage unavailable */ }
+function saveJson(key, value) {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, JSON.stringify(value));
+  } catch { /* storage unavailable (private mode, blocked site data) */ }
 }
 
-let settings = loadSettings();
+let settings = { ...DEFAULTS, ...loadJson(SETTINGS_KEY, {}) };
+
+// What the estimator learned about this phone + browser (sensor axes, GNSS delay) and its
+// mount. Tied to the browser build: an update may change the sensor conventions.
+function loadProfile() {
+  const p = loadJson(PROFILE_KEY, null);
+  return p && p.ua === navigator.userAgent ? p : null;
+}
 
 function estimatorConfig() {
+  const p = DEMO ? null : loadProfile();
   return {
     phonePos: [settings.phoneX, 0, 0.5],
-    outputPoint: [settings.wheelbase / 2, 0, 0.5],
+    device: p ? p.device : null,
+    mount: p ? p.mount : null,
   };
+}
+
+let savedProfileVersion = -1;
+function saveProfile(profile) {
+  if (DEMO || !profile || profile.version === savedProfileVersion) return;
+  savedProfileVersion = profile.version;
+  saveJson(PROFILE_KEY, { ua: navigator.userAgent, device: profile.device, mount: profile.mount, saved: Date.now() });
 }
 
 // ------------------------------------------------------------------ estimator backend
@@ -108,16 +127,18 @@ function record(ev) {
 
 function onOut(out) {
   S.out = out;
+  saveProfile(out.profile);
   trackDrift(out);
 }
 
-// A drift starts when the estimator is in slide mode above 8°, and ends after half a
-// second back below 4° or out of slide mode.
+// A drift starts when the estimator is in slide mode above 8° with a usable reading, and
+// ends after half a second back below 4° or out of slide mode.
 function trackDrift(o) {
-  const b = o.valid && o.beta !== null ? Math.abs(o.beta) : 0;
-  const side = o.valid && o.beta < 0 ? 'left' : 'right';
+  const usable = o.valid && o.beta !== null && o.quality !== 'poor';
+  const b = usable ? Math.abs(o.beta) : 0;
+  const side = usable && o.beta < 0 ? 'left' : 'right';
   if (!S.drift) {
-    if (o.valid && o.sliding && b >= 8) S.drift = { t0: o.t, peak: b, side, calmSince: null };
+    if (usable && o.sliding && b >= 8) S.drift = { t0: o.t, peak: b, side, calmSince: null };
     return;
   }
   const d = S.drift;
@@ -176,7 +197,8 @@ async function begin() {
     userAgent: navigator.userAgent,
     config: estimatorConfig(),
     demo: DEMO,
-    format: 'events: [0, t_ms, gx, gy, gz, ax, ay, az] IMU (rad/s, m/s²) | [1, t_ms, lat, lon, speed, course] GNSS',
+    gyroOrder: 'alpha-beta-gamma',
+    format: 'events: [0, t_ms, alpha, beta, gamma, ax, ay, az] IMU (rotationRate rad/s, m/s²) | [1, t_ms, lat, lon, speed, course] GNSS',
   };
   S.backend = await createBackend(onOut, estimatorConfig());
 
@@ -260,8 +282,12 @@ async function startDemo() {
   ]);
   const seed = Number(params.get('seed')) || 7;
   const rng = new Rng(seed);
-  const phone = randomPhone(rng);
-  const { events } = simulate(SCENARIOS.driftSession(), phone, rng, estimatorConfig());
+  // a phone with the common sensor conventions, so the demo behaves like a known phone
+  const phone = randomPhone(rng, { gyroMap: 0, accelSign: 1, gyroSign: 1, gyroUnit: 1 });
+  const { events } = simulate(SCENARIOS.driftSession(), phone, rng, {
+    phonePos: estimatorConfig().phonePos,
+    outputPoint: [0, 0, 0.5], // same reference point as the estimator (rear axle)
+  });
   const t0 = performance.now();
   let i = 0;
   S.demoTimer = setInterval(() => {
@@ -342,12 +368,6 @@ function setGauge(beta, peak) {
 
 // ------------------------------------------------------------------ render loop
 
-const HINTS = {
-  collecting: 'Drive normally and take a few turns. The meter is learning how the phone is mounted.',
-  'need some accelerating and braking': 'Now accelerate and brake a few times.',
-  'mount direction not yet conclusive': 'Keep driving normally, with some turns and speed changes.',
-  'gyro does not match GNSS turning': 'Keep driving normally. If this lasts, check that the phone is firmly mounted.',
-};
 
 function setChip(el, level, text) {
   el.className = `chip ${level}`;
@@ -377,17 +397,24 @@ function render() {
     statusSub = 'Make sure location is on and the sky is visible.';
   } else if (o.phase === 'standstill') {
     statusMsg = 'Keep the car still';
-    statusSub = 'Measuring gravity direction and gyro bias.';
+    statusSub = 'A couple of seconds: measuring gravity direction and gyro bias.';
     progress = o.progress;
-  } else if (o.phase === 'drive-calibration') {
-    statusMsg = 'Calibrating while you drive';
-    statusSub = HINTS[o.calibrationHint] || HINTS.collecting;
+  } else if (o.phase === 'align') {
+    statusMsg = 'Drive off';
+    statusSub = 'Accelerate firmly in a straight line (a launch is perfect), or take a normal corner. ' +
+      'This shows which way the phone faces.';
     progress = o.progress;
   } else if (!live) {
     statusMsg = o.message || 'Drive faster to measure';
     statusSub = o.message ? '' : 'The angle is shown above 11 km/h.';
   }
-  $('statusPanel').hidden = live && !o.notice;
+  const checking = live && o.sensorCheck === 'pending';
+  if (checking && !statusMsg) {
+    statusMsg = 'Checking sensors';
+    statusSub = 'First time with this phone: after a few corners the meter confirms how its sensors are wired. ' +
+      'Next time it is ready right after the launch.';
+  }
+  $('statusPanel').hidden = live && !o.notice && !checking;
   $('statusNotice').textContent = o && o.notice ? o.notice : '';
   $('statusMsg').textContent = statusMsg;
   $('statusSub').textContent = statusSub;
@@ -437,20 +464,23 @@ function render() {
 
 $('settingsBtn').addEventListener('click', () => {
   $('setPhoneX').value = settings.phoneX;
-  $('setWheelbase').value = settings.wheelbase;
   $('settings').showModal();
+});
+
+$('forgetBtn').addEventListener('click', () => {
+  saveJson(PROFILE_KEY, null);
+  savedProfileVersion = -1;
+  $('forgetBtn').textContent = 'Forgotten';
+  $('forgetBtn').disabled = true;
 });
 
 $('settings').addEventListener('close', () => {
   if ($('settings').returnValue !== 'save') return;
-  const x = Number($('setPhoneX').value), wb = Number($('setWheelbase').value);
-  const next = {
-    phoneX: Number.isFinite(x) ? Math.min(5, Math.max(-1, x)) : DEFAULTS.phoneX,
-    wheelbase: Number.isFinite(wb) ? Math.min(4.5, Math.max(1.5, wb)) : DEFAULTS.wheelbase,
-  };
-  const changed = next.phoneX !== settings.phoneX || next.wheelbase !== settings.wheelbase;
+  const x = Number($('setPhoneX').value);
+  const next = { phoneX: Number.isFinite(x) ? Math.min(5, Math.max(-1, x)) : DEFAULTS.phoneX };
+  const changed = next.phoneX !== settings.phoneX;
   settings = next;
-  saveSettings(settings);
+  saveJson(SETTINGS_KEY, settings);
   if (changed && S.running && S.backend) {
     S.backend.post({ type: 'start', config: estimatorConfig() }); // restarts calibration with the new geometry
     S.logMeta.config = estimatorConfig();
