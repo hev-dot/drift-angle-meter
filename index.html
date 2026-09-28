@@ -151,6 +151,10 @@
   }
   dialog .hint { font-size: 12px; color: var(--text-muted); margin-top: 3px; }
   dialog .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; }
+  dialog .note { font-size: 13px; color: var(--text-secondary); margin: 0 0 12px; }
+  dialog .forget { margin-bottom: 12px; }
+  dialog .forget button { width: 100%; }
+  dialog .hint { font-size: 12px; color: var(--text-muted); margin-top: 3px; }
 
   @media (max-width: 480px) {
     .stats { grid-template-columns: repeat(2, 1fr); }
@@ -180,9 +184,11 @@
     <ol>
       <li><b>Mount the phone firmly</b>, in any orientation. It must not move while you drive.</li>
       <li>Tap <b>Start</b> and allow motion and location access.</li>
-      <li><b>Keep the car still</b> for about 3 seconds.</li>
-      <li><b>Drive normally for about a minute</b>: a few turns, some accelerating and braking.</li>
-      <li>Once the gauge is live, go drift.</li>
+      <li><b>Keep the car still</b> for 2 seconds, e.g. on the start line.</li>
+      <li><b>Drive off</b>: a firm straight launch (or a normal corner) tells the meter which way the phone faces.
+        The gauge goes live a couple of seconds later.</li>
+      <li>First time with a phone, the meter also checks its sensors during the first corners.
+        After that it remembers the phone and its mount.</li>
     </ol>
     <button class="primary start" id="startBtn">Start</button>
     <p class="error" id="introError" role="alert"></p>
@@ -229,10 +235,11 @@
         <input type="number" id="setPhoneX" step="0.1" min="-1" max="5" inputmode="decimal">
         <div class="hint">A phone on the dashboard is typically about 1.5–1.8 m ahead of the rear axle.</div>
       </label>
-      <label>Wheelbase (m)
-        <input type="number" id="setWheelbase" step="0.05" min="1.5" max="4.5" inputmode="decimal">
-        <div class="hint">The angle is reported at the middle of the wheelbase. Most cars: 2.4–2.9 m.</div>
-      </label>
+      <p class="note">The drift angle is measured at the rear axle, so it reads about 0° whenever the car grips.</p>
+      <div class="forget">
+        <button type="button" id="forgetBtn">Forget this phone's calibration</button>
+        <div class="hint">Use after changing the mount or updating the browser if readings look wrong.</div>
+      </div>
       <div class="row">
         <button value="cancel" formnovalidate>Cancel</button>
         <button value="save" class="primary" id="settingsSave">Save</button>
