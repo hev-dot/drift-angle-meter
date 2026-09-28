@@ -1,6 +1,6 @@
 // Browser sensor adapters. They convert whatever the browser delivers into the
 // estimator's input format on one monotonic clock (performance.now(), ms):
-//   IMU:  { t, gyro: [x, y, z] rad/s, accel: [x, y, z] m/s² incl. gravity }, device axes
+//   IMU:  { t, gyro: rotationRate [alpha, beta, gamma] rad/s, accel: [x, y, z] m/s² incl. gravity }
 //   GNSS: { t, lat, lon, speed (m/s | null), course (deg from north | null) }
 // Sign or unit quirks of individual browsers are not corrected here; the estimator
 // detects them during calibration.
@@ -49,10 +49,12 @@ export function startMotion(onSample) {
       return;
     }
     stats.samples++;
-    // rotationRate: alpha about z, beta about x, gamma about y (deg/s per spec)
+    // rotationRate is passed on in its native [alpha, beta, gamma] order (deg/s -> rad/s).
+    // Browsers disagree on which device axis each one is about (Chrome on Android:
+    // x, y, z; the spec text: z, x, y); the estimator detects it.
     onSample({
       t: eventTime(e),
-      gyro: [r.beta * DEG, r.gamma * DEG, r.alpha * DEG],
+      gyro: [r.alpha * DEG, r.beta * DEG, r.gamma * DEG],
       accel: [a.x, a.y, a.z],
     });
   };
