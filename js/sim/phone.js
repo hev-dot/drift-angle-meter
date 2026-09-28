@@ -61,12 +61,15 @@ export function randomPhone(rng, overrides = {}) {
     gnssSmoothing: rng.pick([0, 0, 0.3, 0.6, 1.0]),
     gnssNoDoppler: rng.chance(0.1),
     gnssDrop: 0.02,
-    accelSign: rng.chance(0.15) ? -1 : 1,
-    gyroUnit: rng.chance(0.1) ? rng.pick([180 / Math.PI, Math.PI / 180]) : 1,
-    gyroSign: rng.chance(0.1) ? -1 : 1,
+    accelSign: rng.chance(0.05) ? -1 : 1,
+    gyroUnit: rng.chance(0.05) ? rng.pick([180 / Math.PI, Math.PI / 180]) : 1,
+    gyroSign: rng.chance(0.05) ? -1 : 1,
     rollGrad: rng.uniform(0.3, 0.6) * DEG,
     pitchGrad: rng.uniform(0.2, 0.5) * DEG,
     tireSlip: rng.uniform(0.2, 0.5) * DEG,
+    // how the browser labels rotationRate: 0 = alpha/beta/gamma about x/y/z (Chrome),
+    // 1 = about z/x/y (W3C spec text); see GYRO_MAPS
+    gyroMap: rng.chance(0.3) ? 1 : 0,
   };
   return { ...p, ...overrides };
 }
@@ -127,8 +130,10 @@ export function simulate(scenario, phone, rng, cfg) {
         for (let k = 0; k < 3; k++) bias[k] += phone.gyroJump.d[k];
         jumped = true;
       }
-      const gyro = [0, 1, 2].map((k) =>
+      const w = [0, 1, 2].map((k) =>
         ((1 + phone.gyroScale[k]) * sumW[k] / nSum + bias[k] + rng.gauss(phone.gyroNoise)) * phone.gyroUnit * phone.gyroSign);
+      // adapter output is rotationRate [alpha, beta, gamma]
+      const gyro = phone.gyroMap === 1 ? [w[2], w[0], w[1]] : w;
       const accel = [0, 1, 2].map((k) =>
         ((1 + phone.accelScale[k]) * sumF[k] / nSum + phone.accelBias[k] + rng.gauss(phone.accelNoise)) * phone.accelSign);
       sumF.fill(0); sumW.fill(0); nSum = 0;
