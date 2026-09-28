@@ -1,17 +1,195 @@
 // Self-calibration: everything that differs between phones, browsers and mounts is
 // found at runtime instead of being configured.
 //
-// 1. Standstill (a few seconds): gravity direction in phone axes -> "up",
+// 1. Standstill (a couple of seconds): gravity direction in phone axes -> "up",
 //    gyro bias, sensor noise levels.
-// 2. Normal driving with some turns (about a minute): compared against GNSS,
-//    - GNSS latency and gyro gain (units / sign faults), from course vs gyro yaw,
-//    - accelerometer handedness (sign fault), from horizontal accel vs GNSS kinematics,
-//    - mount yaw (which way is forward), from horizontal accel vs [along-track, centripetal].
+// 2. Mount yaw (which way is forward) from the first straight acceleration, e.g. the
+//    launch off the start line (MountAligner): a few seconds.
+// 3. In the background while driving (DriveCalibrator), compared against GNSS:
+//    - gyro axis order, units and sign, GNSS latency and smoothing, from course vs gyro yaw
+//      (after ~150° of turning),
+//    - accelerometer handedness (sign fault), from horizontal accel vs GNSS kinematics.
+//    These are properties of the phone + browser, so they are remembered between sessions.
 
 import {
   normalize, dot, cross, scale, fromRows, wrapPi, DEG,
 } from './math.js';
 import { latencyCandidates, argminRefined } from './latency.js';
+
+// Browsers disagree on how DeviceMotionEvent.rotationRate's alpha/beta/gamma map to the
+// device axes. The adapter delivers [alpha, beta, gamma] (rad/s); these are the known
+// interpretations, as functions returning [x, y, z].
+export const GYRO_MAPS = [
+  (g) => [g[0], g[1], g[2]], // alpha = x, beta = y, gamma = z (Chrome on Android, measured)
+  (g) => [g[1], g[2], g[0]], // alpha = z, beta = x, gamma = y (W3C specification text)
+];
+
+// Horizontal basis in raw phone axes: e1 = the phone axis closest to horizontal,
+// projected onto the horizontal plane; e2 = up x e1.
+function levelBasis(up) {
+  const axes = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  let best = axes[0];
+  for (const a of axes) if (Math.abs(dot(a, up)) < Math.abs(dot(best, up))) best = a;
+  const e1 = normalize(cross(cross(up, best), up));
+  return { e1, e2: cross(up, e1) };
+}
+
+// Vehicle <- phone rotation from "up" and "forward" in raw accelerometer axes.
+// A sign-inverted accelerometer inverts both, so both are multiplied by accelSign.
+export function mountRotation(upRaw, fwdRaw, accelSign = 1) {
+  const up = scale(normalize(upRaw), accelSign);
+  let fwd = scale(fwdRaw, accelSign);
+  fwd = normalize([fwd[0] - dot(fwd, up) * up[0], fwd[1] - dot(fwd, up) * up[1], fwd[2] - dot(fwd, up) * up[2]]);
+  return fromRows(fwd, cross(up, fwd), up);
+}
+
+// Finds which way is forward from straight-line speed changes (the launch off the
+// start line, or any firm straight acceleration or braking). Integrating the leveled
+// accelerometer over the window gives the velocity change in phone axes; GNSS says how
+// much the speed changed and that the course stayed constant. Gravity and accelerometer
+// bias cancel because the standstill reading is subtracted.
+// Also uses steady turns: there the (centripetal) acceleration points along the car's
+// left-right axis, with the side given by the gyro's yaw direction.
+export class MountAligner {
+  constructor(standstill, {
+    latency = 0.2, minDeltaSpeed = 2.5, maxCourseChange = 10 * DEG, gyroMap = 0, gyroGain = 1,
+  } = {}) {
+    this.up = standstill.up;
+    this.gRef = scale(standstill.up, standstill.gravity);
+    this.bias = standstill.gyroBias;
+    this.gyroMap = gyroMap;
+    this.gyroGain = gyroGain;
+    ({ e1: this.e1, e2: this.e2 } = levelBasis(this.up));
+    this.L = latency;
+    this.minDs = minDeltaSpeed;
+    this.maxCourse = maxCourseChange;
+    this.T = []; this.c1 = []; this.c2 = []; this.cY = [];
+    this._last = null;
+    this.fixes = [];
+    this.sum = [0, 0];
+    this.n = 0;
+    this.dirs = [];
+    this.usedUntil = -Infinity;
+    this.progress = 0;
+  }
+
+  addImu(t, accelRaw, gyroRaw) {
+    const d = [accelRaw[0] - this.gRef[0], accelRaw[1] - this.gRef[1], accelRaw[2] - this.gRef[2]];
+    const a1 = dot(d, this.e1), a2 = dot(d, this.e2);
+    const g = GYRO_MAPS[this.gyroMap]([gyroRaw[0] - this.bias[0], gyroRaw[1] - this.bias[1], gyroRaw[2] - this.bias[2]]);
+    const r = this.gyroGain * dot(g, this.up);
+    const n = this.T.length;
+    if (n === 0) {
+      this.T.push(t); this.c1.push(0); this.c2.push(0); this.cY.push(0);
+    } else {
+      const dt = t - this.T[n - 1];
+      if (dt <= 0) return;
+      this.T.push(t);
+      this.c1.push(this.c1[n - 1] + 0.5 * (a1 + this._last[0]) * dt);
+      this.c2.push(this.c2[n - 1] + 0.5 * (a2 + this._last[1]) * dt);
+      this.cY.push(this.cY[n - 1] + 0.5 * (r + this._last[2]) * dt);
+    }
+    this._last = [a1, a2, r];
+    if (this.T[0] < t - 30) {
+      let k = 0;
+      while (this.T[k] < t - 20) k++;
+      this.T.splice(0, k); this.c1.splice(0, k); this.c2.splice(0, k); this.cY.splice(0, k);
+    }
+  }
+
+  // Steady turn between fixes a and b: the leveled velocity change is v * dPsi along
+  // the car's left axis (towards the inside of the turn).
+  _turnWindow(a, b) {
+    const dt = b.t - a.t;
+    if (dt < 0.9 || dt > 3 || a.speed < 2.5 || b.speed < 2.5 || Math.abs(b.speed - a.speed) > 1) return;
+    // IMU-only window (no GNSS timing involved), ending at the fix minus the delay
+    const t0 = a.t - this.L, t1 = b.t - this.L;
+    const y0 = interp(this.T, this.cY, t0), y1 = interp(this.T, this.cY, t1);
+    const p0 = interp(this.T, this.c1, t0), p1 = interp(this.T, this.c1, t1);
+    const q0 = interp(this.T, this.c2, t0), q1 = interp(this.T, this.c2, t1);
+    if (y0 === null || y1 === null || p0 === null || q0 === null) return;
+    const dPsi = y1 - y0;
+    if (Math.abs(dPsi) < 15 * DEG || Math.abs(dPsi) > 60 * DEG) return;
+    // course must turn by about the same amount (grip, and a plausible gyro)
+    if (a.chi === null || b.chi === null || Math.abs(wrapPi(b.chi - a.chi) - dPsi) > 0.3 * Math.abs(dPsi) + 5 * DEG) return;
+    const dv = [p1 - p0, q1 - q0];
+    // expected velocity change in vehicle axes: [speed change, v * dPsi to the left]
+    const u = [b.speed - a.speed, 0.5 * (a.speed + b.speed) * dPsi];
+    // the sideways part must dominate sensor bias and tilt errors (~0.1-0.2 m/s² x dt)
+    if (Math.abs(u[1]) < 1.5 || Math.abs(u[0]) > 0.5 * Math.abs(u[1])) return;
+    const expect = Math.hypot(u[0], u[1]);
+    const mag = Math.hypot(dv[0], dv[1]);
+    if (mag < 0.7 * expect || mag > 1.4 * expect) return;
+    // forward is the leveled-phone direction that rotates u onto dv
+    const ang = Math.atan2(dv[1], dv[0]) - Math.atan2(u[1], u[0]);
+    const fwd = [Math.cos(ang), Math.sin(ang)];
+    this.sum[0] += fwd[0] * expect;
+    this.sum[1] += fwd[1] * expect;
+    this.dirs.push(ang);
+    this.n++;
+    this.usedUntil = b.t;
+  }
+
+  // fix: { t, speed, chi } (chi: course, rad CCW from east, or null)
+  addGnss(fix) {
+    if (!Number.isFinite(fix.speed)) return;
+    this.fixes.push(fix);
+    while (this.fixes.length && this.fixes[0].t < fix.t - 12) this.fixes.shift();
+    const b = fix;
+    if (b.speed < 3 || b.chi === null) return;
+    // turn windows of 1-3 s, longest first (gentle turns need a longer window)
+    for (let i = 0; i < this.fixes.length - 1; i++) {
+      const a = this.fixes[i];
+      if (b.t - a.t > 3 || a.t < this.usedUntil) continue;
+      if (b.t - a.t < 0.9) break;
+      const n0 = this.n;
+      this._turnWindow(a, b);
+      if (this.n > n0) return;
+    }
+    let start = -1;
+    for (let i = this.fixes.length - 2; i >= 0; i--) {
+      const a = this.fixes[i];
+      if (b.t - a.t > 8 || a.t < this.usedUntil) break;
+      if (a.speed >= 3 && (a.chi === null || Math.abs(wrapPi(a.chi - b.chi)) > this.maxCourse)) break;
+      const ds = Math.abs(b.speed - a.speed);
+      this.progress = Math.max(this.progress, Math.min(1, ds / this.minDs));
+      if (ds >= this.minDs) { start = i; break; }
+    }
+    if (start < 0) return;
+    const a = this.fixes[start];
+    const ds = b.speed - a.speed;
+    const p = [interp(this.T, this.c1, a.t - this.L), interp(this.T, this.c1, b.t - this.L)];
+    const q = [interp(this.T, this.c2, a.t - this.L), interp(this.T, this.c2, b.t - this.L)];
+    const y = [interp(this.T, this.cY, a.t - this.L - 0.5), interp(this.T, this.cY, b.t - this.L)];
+    if (p.includes(null) || q.includes(null)) return;
+    // straight according to the gyro too (GNSS course says nothing at walking pace)
+    if (y[0] !== null && y[1] !== null && Math.abs(y[1] - y[0]) > 5 * DEG) return;
+    const dv = [p[1] - p[0], q[1] - q[0]];
+    const mag = Math.hypot(dv[0], dv[1]);
+    if (mag < 0.5 * Math.abs(ds) || mag > 2 * Math.abs(ds)) return; // not a clean straight-line speed change
+    const s = Math.sign(ds);
+    this.sum[0] += s * dv[0];
+    this.sum[1] += s * dv[1];
+    this.dirs.push(Math.atan2(s * dv[1], s * dv[0]));
+    this.n++;
+    this.usedUntil = b.t;
+  }
+
+  // { fwdRaw, sigma } once at least one clean straight speed change has been seen.
+  get result() {
+    if (this.n === 0) return null;
+    const a = Math.atan2(this.sum[1], this.sum[0]);
+    let spread = 0;
+    for (const d of this.dirs) spread += wrapPi(d - a) ** 2;
+    spread = this.n > 1 ? Math.sqrt(spread / (this.n - 1)) : 0;
+    const c = Math.cos(a), s = Math.sin(a);
+    return {
+      fwdRaw: [0, 1, 2].map((k) => c * this.e1[k] + s * this.e2[k]),
+      sigma: Math.max(3 * DEG / Math.sqrt(this.n), spread / Math.sqrt(this.n), 1 * DEG),
+      n: this.n,
+    };
+  }
+}
 
 // Sliding window of recent raw samples, used for standstill detection.
 export class MotionWindow {
@@ -128,37 +306,44 @@ function lpfSeries(T, X, tau) {
 const GAIN_CANDIDATES = [1, 180 / Math.PI, Math.PI / 180];
 const SMOOTHING_CANDIDATES = [0, 0.15, 0.3, 0.45, 0.6, 0.75, 0.9, 1.05, 1.2, 1.35, 1.5];
 
+// Background sensor check while driving. solve() returns
+//   { sensors, full }
+// sensors (after ~150° of turning): gyro axis order, gyro units, raw gain sign,
+//   GNSS latency and smoothing.
+// full (needs turns plus speed changes): additionally accelerometer handedness, the
+//   corrected gyro sign and a turn-based mount estimate (the slow path used when no
+//   straight acceleration has been seen).
 export class DriveCalibrator {
   // standstill: StandstillCalibrator.result()
   constructor(standstill, opts = {}) {
     this.upRaw = standstill.up;
     this.biasRaw = standstill.gyroBias;
-    this.opts = { minSpeed: 4, minTurn: 2 * Math.PI, minPairs: 20, maxAlphaSigma: 2 * DEG, maxLag: 1.2, ...opts };
-    // e1: the phone axis closest to horizontal, projected onto the horizontal plane.
-    const axes = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
-    let best = axes[0];
-    for (const a of axes) if (Math.abs(dot(a, this.upRaw)) < Math.abs(dot(best, this.upRaw))) best = a;
-    this.e1 = normalize(cross(cross(this.upRaw, best), this.upRaw));
-    this.e2 = cross(this.upRaw, this.e1);
-    this.T = []; this.cR = []; this.cA1 = []; this.cA2 = [];
+    this.opts = {
+      minSpeed: 4, minTurnSensors: 100 * DEG, minPairsSensors: 4,
+      minTurn: 2 * Math.PI, minPairs: 20, maxAlphaSigma: 2 * DEG, maxLag: 1.2, ...opts,
+    };
+    ({ e1: this.e1, e2: this.e2 } = levelBasis(this.upRaw));
+    this.T = []; this.cR = GYRO_MAPS.map(() => []); this.cA1 = []; this.cA2 = [];
     this._last = null;
     this.fixes = [];
     this.status = { progress: 0, reason: 'collecting' };
+    this.sensors = null;
   }
 
   addImu(t, gyroRaw, accelRaw) {
     const g = [gyroRaw[0] - this.biasRaw[0], gyroRaw[1] - this.biasRaw[1], gyroRaw[2] - this.biasRaw[2]];
-    const r = dot(g, this.upRaw);
+    const r = GYRO_MAPS.map((m) => dot(m(g), this.upRaw));
     const a1 = dot(accelRaw, this.e1), a2 = dot(accelRaw, this.e2);
     const n = this.T.length;
     if (n === 0) {
-      this.T.push(t); this.cR.push(0); this.cA1.push(0); this.cA2.push(0);
+      this.T.push(t); this.cA1.push(0); this.cA2.push(0);
+      for (const c of this.cR) c.push(0);
     } else {
       const dt = t - this.T[n - 1];
       if (dt <= 0) return;
       const p = this._last;
       this.T.push(t);
-      this.cR.push(this.cR[n - 1] + 0.5 * (r + p.r) * dt);
+      for (let m = 0; m < r.length; m++) this.cR[m].push(this.cR[m][n - 1] + 0.5 * (r[m] + p.r[m]) * dt);
       this.cA1.push(this.cA1[n - 1] + 0.5 * (a1 + p.a1) * dt);
       this.cA2.push(this.cA2[n - 1] + 0.5 * (a2 + p.a2) * dt);
     }
@@ -170,9 +355,10 @@ export class DriveCalibrator {
     this.fixes.push(fix);
   }
 
-  // Non-overlapping windows of ~2 s between fixes. Long windows make smoothed GNSS
-  // (common with fused location providers) behave like a pure delay.
-  _pairs() {
+  // Non-overlapping windows between fixes, at least minDt long. Long windows make smoothed
+  // GNSS (common with fused location providers) behave like a pure delay; short ones give
+  // more clean windows while drifting.
+  _pairs(minDt = 1.9) {
     const out = [];
     const F = this.fixes, minV = this.opts.minSpeed;
     let a = null;
@@ -180,7 +366,7 @@ export class DriveCalibrator {
       if (b.chi === null || b.speed < minV) { a = null; continue; }
       if (a === null) { a = b; continue; }
       const dt = b.t - a.t;
-      if (dt < 1.9) continue;
+      if (dt < minDt) continue;
       if (dt > 3.5) { a = b; continue; }
       const prev = a;
       a = b;
@@ -194,63 +380,135 @@ export class DriveCalibrator {
     return out;
   }
 
-  // Attempt to solve (at most about once a second). Returns null while more data is
-  // needed (see this.status).
-  solve() {
-    const F = this.fixes;
-    const tNow = F.length ? F[F.length - 1].t : 0;
-    if (this._lastSolve !== undefined && tNow - this._lastSolve < 1) return null;
-    this._lastSolve = tNow;
-    const pairs = this._pairs();
-    const turn = pairs.reduce((s, p) => s + Math.abs(p.dChi), 0);
-    this.status = {
-      progress: Math.min(1, Math.min(turn / this.opts.minTurn, pairs.length / this.opts.minPairs)),
-      reason: 'collecting',
-    };
-    if (turn < this.opts.minTurn || pairs.length < this.opts.minPairs) return null;
-
-    // 1. GNSS smoothing, latency and gyro gain: dChi ~ k * dPsi_smoothed(L), over a grid
-    //    of smoothing time constants (refined), each with a latency grid (refined).
+  // Best (smoothing, latency, gain) for one gyro axis order: dChi ~ k * dPsi_smoothed(L).
+  // Robust: windows where course and heading turned differently (drift entries, exits and
+  // transitions, where the drift angle changed) are outliers; their squared residual is
+  // capped so they cannot pull the fit. Steady-angle drifting still counts as good data.
+  _fitMap(cR, pairs, smoothingCandidates) {
     const cand = latencyCandidates(this.opts.maxLag);
+    const minN = Math.min(this.opts.minPairs, pairs.length);
+    const CAP = (4 * DEG) ** 2;
     const fitLag = (tau) => {
-      const fR = lpfSeries(this.T, this.cR, tau);
+      const fR = lpfSeries(this.T, cR, tau);
       const cost = new Float64Array(cand.length).fill(Infinity);
       const gains = new Float64Array(cand.length);
+      const d = new Float64Array(pairs.length);
       for (let j = 0; j < cand.length; j++) {
         const L = cand[j];
-        let sxy = 0, sxx = 0, syy = 0, n = 0;
-        for (const p of pairs) {
+        let sxy = 0, sxx = 0, n = 0;
+        for (let i = 0; i < pairs.length; i++) {
+          const p = pairs[i];
           const a = interp(this.T, fR, p.t0 - L), b = interp(this.T, fR, p.t1 - L);
-          if (a === null || b === null) continue;
-          const d = b - a;
-          sxy += d * p.dChi; sxx += d * d; syy += p.dChi * p.dChi; n++;
+          d[i] = a === null || b === null ? NaN : b - a;
+          if (Number.isNaN(d[i])) continue;
+          sxy += d[i] * p.dChi; sxx += d[i] * d[i]; n++;
         }
-        if (n < this.opts.minPairs || sxx <= 0) continue;
-        gains[j] = sxy / sxx;
-        cost[j] = (syy - sxy * sxy / sxx) / n;
+        if (n < minN || sxx <= 0) continue;
+        // gain from least squares, then refitted on the windows it explains (twice)
+        let k = sxy / sxx;
+        for (let it = 0; it < 2; it++) {
+          let ixy = 0, ixx = 0;
+          for (let i = 0; i < pairs.length; i++) {
+            if (Number.isNaN(d[i])) continue;
+            if ((pairs[i].dChi - k * d[i]) ** 2 < CAP) { ixy += d[i] * pairs[i].dChi; ixx += d[i] * d[i]; }
+          }
+          if (ixx > 0) k = ixy / ixx;
+        }
+        let c = 0, inl = 0, inlTurn = 0;
+        for (let i = 0; i < pairs.length; i++) {
+          if (Number.isNaN(d[i])) continue;
+          const e2 = (pairs[i].dChi - k * d[i]) ** 2;
+          c += Math.min(e2, CAP);
+          if (e2 < CAP) { inl++; inlTurn += Math.abs(pairs[i].dChi); }
+        }
+        gains[j] = k;
+        cost[j] = c / n;
+        inliers[j] = inl / n;
+        inlierTurn[j] = inlTurn;
       }
       const { x, index } = argminRefined(cand, cost);
-      return { cost: cost[index], latency: x, k: gains[index], tau, fR };
+      return {
+        cost: cost[index], latency: x, k: gains[index], tau, fR,
+        inlierFraction: inliers[index], inlierTurn: inlierTurn[index],
+      };
     };
-    const fits = SMOOTHING_CANDIDATES.map(fitLag);
-    const iBest = argminRefined(SMOOTHING_CANDIDATES, fits.map((f) => f.cost));
+    const inliers = new Float64Array(cand.length), inlierTurn = new Float64Array(cand.length);
+    if (smoothingCandidates.length === 1) return fitLag(smoothingCandidates[0]);
+    const fits = smoothingCandidates.map(fitLag);
+    const S = smoothingCandidates;
+    const iBest = argminRefined(S, fits.map((f) => f.cost));
     // argminRefined assumes an even grid; refine only between equally spaced neighbours
     const i = iBest.index;
     const evenNeighbours = i > 0 && i < fits.length - 1 &&
-      Math.abs((SMOOTHING_CANDIDATES[i + 1] - SMOOTHING_CANDIDATES[i]) - (SMOOTHING_CANDIDATES[i] - SMOOTHING_CANDIDATES[i - 1])) < 1e-9;
+      Math.abs((S[i + 1] - S[i]) - (S[i] - S[i - 1])) < 1e-9;
     let best = fits[i];
     if (evenNeighbours && Math.abs(iBest.x - best.tau) > 0.01) {
       const refined = fitLag(Math.max(0, iBest.x));
       if (refined.cost < best.cost) best = refined;
     }
-    if (!Number.isFinite(best.cost)) return null;
-    const { latency, k, tau: smoothing, fR } = best;
-    let unit = GAIN_CANDIDATES[0];
-    for (const c of GAIN_CANDIDATES) if (Math.abs(Math.log(Math.abs(k) / c)) < Math.abs(Math.log(Math.abs(k) / unit))) unit = c;
-    if (Math.abs(Math.abs(k) / unit - 1) > 0.25) {
-      this.status.reason = 'gyro does not match GNSS turning';
-      return null;
+    return best;
+  }
+
+  // Attempt to solve (at most about every 2 s). Returns null while nothing is conclusive
+  // (see this.status).
+  solve() {
+    const F = this.fixes;
+    const tNow = F.length ? F[F.length - 1].t : 0;
+    if (this._lastSolve !== undefined && tNow - this._lastSolve < 2) return null;
+    this._lastSolve = tNow;
+    const pairs = this._pairs();
+    const turn = pairs.reduce((s, p) => s + Math.abs(p.dChi), 0);
+    this.status = {
+      progress: Math.min(1, Math.min(turn / this.opts.minTurnSensors, pairs.length / this.opts.minPairsSensors)),
+      reason: 'collecting',
+    };
+    if (turn < this.opts.minTurnSensors || pairs.length < this.opts.minPairsSensors) return null;
+
+    // 1. Gyro axis order: the order whose yaw explains the course changes, judged on 1 s
+    //    turning windows and fitted with a pure GNSS delay (smoothing needs more data to
+    //    separate from delay). Decided only with a clear margin and when most turning
+    //    windows agree; while drifting, entries and transitions do not count.
+    const turning = this._pairs(0.9).filter((p) => Math.abs(p.dChi) > 4 * DEG);
+    if (turning.length < this.opts.minPairsSensors) return null;
+    // A wrong axis order cannot explain the turning with a plausible gain (±1, or a
+    // deg/rad unit mix-up); the right one does, on most of the turning.
+    const classify = (k, tol) => {
+      if (!Number.isFinite(k) || k === 0) return null;
+      let unit = GAIN_CANDIDATES[0];
+      for (const c of GAIN_CANDIDATES) if (Math.abs(Math.log(Math.abs(k) / c)) < Math.abs(Math.log(Math.abs(k) / unit))) unit = c;
+      return Math.abs(Math.abs(k) / unit - 1) > tol ? null : unit;
+    };
+    const quick = this.cR.map((cR) => this._fitMap(cR, turning, [0]));
+    const ok = quick.map((f) => Number.isFinite(f.cost) && classify(f.k, 0.15) !== null &&
+      f.inlierFraction >= 0.35 && f.inlierTurn >= this.opts.minTurnSensors);
+    let m = -1;
+    for (let j = 0; j < quick.length; j++) if (ok[j] && (m < 0 || quick[j].cost < quick[m].cost)) m = j;
+    const nOk = ok.filter(Boolean).length;
+    const margin = m < 0 ? 0 : Math.min(...quick.filter((_, j) => j !== m).map((f) => f.cost)) / Math.max(quick[m].cost, 1e-12);
+    if (m < 0 || (nOk > 1 && margin < 1.5)) {
+      // Early switch: the assumed order is clearly implausible and exactly one other order
+      // already explains the turning. Leaving a wrong order is urgent (its angles are
+      // garbage); confirming the right one can wait for more data.
+      const assumed = this.opts.assumedMap ?? 0;
+      const early = quick.map((f, j) => j !== assumed && Number.isFinite(f.cost) && classify(f.k, 0.15) !== null &&
+        f.inlierFraction >= 0.35 && f.inlierTurn >= 0.5 * this.opts.minTurnSensors);
+      if (classify(quick[assumed].k, 0.35) === null && early.filter(Boolean).length === 1) {
+        m = early.indexOf(true);
+      } else {
+        this.status.reason = 'checking sensor axes';
+        return null;
+      }
     }
+    const unit = classify(quick[m].k, 0.15);
+    const sensors = {
+      gyroMap: m, gyroUnit: unit, kRaw: quick[m].k, latency: Math.max(0, quick[m].latency), smoothing: 0, margin,
+    };
+    this.sensors = sensors;
+    this.status.progress = Math.min(1, Math.min(turn / this.opts.minTurn, pairs.length / this.opts.minPairs));
+    if (turn < this.opts.minTurn || pairs.length < this.opts.minPairs) return { sensors, full: null };
+
+    // With plenty of turning: GNSS smoothing and delay separately, for the chosen axis order.
+    const { latency, k, tau: smoothing, fR } = this._fitMap(this.cR[m], pairs, SMOOTHING_CANDIDATES);
 
     // 2. Horizontal acceleration windows (IMU smoothed and shifted like the GNSS).
     const fA1 = lpfSeries(this.T, this.cA1, smoothing), fA2 = lpfSeries(this.T, this.cA2, smoothing);
@@ -285,7 +543,7 @@ export class DriveCalibrator {
     this.status.handedness = handedness;
     if (handedness < 30) {
       this.status.reason = 'need some accelerating and braking';
-      return null;
+      return { sensors, full: null };
     }
     const accelSign = ref > rot ? -1 : 1;
 
@@ -313,25 +571,26 @@ export class DriveCalibrator {
     const alphaSigma = Math.sqrt(res / Math.max(2 * UW.length - 1, 1) / uu);
     if (alphaSigma > this.opts.maxAlphaSigma) {
       this.status.reason = 'mount direction not yet conclusive';
-      return null;
+      return { sensors, full: null };
     }
 
-    // Vehicle frame axes expressed in phone axes.
+    // Forward in raw accelerometer axes (see mountRotation for the sign convention).
     const up = scale(this.upRaw, accelSign);
     const e2 = cross(up, this.e1);
     const xv = [c * this.e1[0] + s * e2[0], c * this.e1[1] + s * e2[1], c * this.e1[2] + s * e2[2]];
-    const yv = cross(up, xv);
     this.status = { progress: 1, reason: 'done' };
     return {
-      accelSign,
-      gyroGain,
-      gyroBiasRaw: this.biasRaw,
-      R: fromRows(xv, yv, up), // vehicle <- phone
-      alphaSigma: Math.max(alphaSigma, 0.5 * DEG),
-      latency: Math.max(0, latency),
-      smoothing,
-      pairs: pairs.length,
-      gainFit: kCorr / (Math.sign(kCorr) * unit),
+      sensors,
+      full: {
+        gyroMap: m,
+        accelSign,
+        gyroGain,
+        fwdRaw: scale(xv, accelSign),
+        alphaSigma: Math.max(alphaSigma, 0.5 * DEG),
+        latency: Math.max(0, latency),
+        smoothing,
+        pairs: pairs.length,
+      },
     };
   }
 }
