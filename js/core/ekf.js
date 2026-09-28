@@ -24,7 +24,7 @@ export const DEFAULT_NOISE = {
   accelDensity: 0.12,       // m/s²/√Hz, white accel noise incl. road vibration
   gyroBiasWalk: 0.0003,     // rad/s/√s
   accelBiasWalk: 0.004,     // m/s²/√s
-  scaleWalk: 1e-4,          // 1/√s
+  scaleWalk: 2e-5,          // 1/√s (a constant property of the gyro; it should barely move)
   alphaWalk: 2e-4,          // rad/√s
 };
 
@@ -200,7 +200,7 @@ export class DriftEKF {
       this.bg[i] = clamp(this.bg[i] + dx[I_BG + i], -0.1, 0.1);
       this.ba[i] = clamp(this.ba[i] + dx[I_BA + i], -1.5, 1.5);
     }
-    this.s = clamp(this.s + dx[I_S], -0.1, 0.1);
+    this.s = clamp(this.s + dx[I_S], -0.04, 0.04); // phone gyros are within a few percent
     this.alpha = clamp(this.alpha + dx[I_AL], -0.3, 0.3);
     if (this.tau) { this.vs[0] += dx[I_VS]; this.vs[1] += dx[I_VS + 1]; }
   }
@@ -256,7 +256,8 @@ export class DriftEKF {
     h[0] = Hth[0]; h[1] = Hth[1]; h[2] = Hth[2];
     h[3] = Hv[0]; h[4] = Hv[1]; h[5] = Hv[2];
     h[I_BG + 2] = p[0] * (1 + this.s);
-    h[I_S] = -p[0] * this.wzRaw;
+    // (no scale-factor term: with an uncertain phone position this constraint would push
+    // the gyro scale to absorb the lever-arm error; GNSS course over turns pins the scale)
     h[I_AL] = u[0];
     return this.update([h], [-hVal], [sigma * sigma], gate);
   }
@@ -322,6 +323,36 @@ export class DriftEKF {
   // Admit extra heading uncertainty (e.g. after a long slide the heading may have drifted).
   inflateHeading(sigma) {
     this.P[2 * this.n + 2] += sigma * sigma;
+  }
+
+  // Admit extra horizontal velocity uncertainty.
+  inflateVelocity(sigma) {
+    const n = this.n;
+    this.P[3 * n + 3] += sigma * sigma;
+    this.P[4 * n + 4] += sigma * sigma;
+    if (this.tau) { this.P[14 * n + 14] += sigma * sigma; this.P[15 * n + 15] += sigma * sigma; }
+  }
+
+  // Replace heading and horizontal velocity (e.g. from GNSS course when pulling away after
+  // slow manoeuvring), keeping roll, pitch, biases and their uncertainty.
+  resetHeading(yaw, vE, vN, sigmaYaw, sigmaVel) {
+    const C = qToMat(this.q);
+    const cur = Math.atan2(C[3], C[0]);
+    const d = yaw - cur;
+    this.q = qnormalize(qmul([Math.cos(d / 2), 0, 0, Math.sin(d / 2)], this.q)); // rotate about nav z
+    this.v = [vE, vN, this.v[2]];
+    if (this.tau) this.vs = [vE, vN];
+    const n = this.n, P = this.P;
+    for (const [i, s] of [[2, sigmaYaw], [3, sigmaVel], [4, sigmaVel]]) {
+      for (let j = 0; j < n; j++) { P[i * n + j] = 0; P[j * n + i] = 0; }
+      P[i * n + i] = s * s;
+    }
+    if (this.tau) {
+      for (const i of [14, 15]) {
+        for (let j = 0; j < n; j++) { P[i * n + j] = 0; P[j * n + i] = 0; }
+        P[i * n + i] = sigmaVel * sigmaVel;
+      }
+    }
   }
 
   headingSigma() {
